@@ -1,45 +1,225 @@
 # Logic Automation Studio
 
-一个可编辑的本地自动化脚本引擎（MVP），支持通过图形界面编排流程，并执行多种动作与条件判断。
+一个面向桌面自动化的可视化脚本编辑器。  
+核心目标是：用“流程逻辑 + 条件分支”替代纯坐标脚本，提高自动化在不同界面状态下的鲁棒性。
 
-## 功能概览
+---
 
-- 点击动作：`ClickText` / `ClickPosition` / `ClickImage`
-- 输入动作：`TypeText` / `KeyPress`
-- 控制动作：`Wait` / `IfElse`（`on_true` / `on_false`）
-- 稳定性：重试、失败跳转、运行日志、流程图预览
-- 坐标处理：支持 DPI 场景，图片识别默认可全屏自适应
+## 1. 项目定位
 
-## 目录结构
+本项目不是简单的“录制回放器”，而是一个小型流程引擎：
 
-- `automation_studio.py`：主界面（流程编辑与运行）
-- `automation_runtime.py`：运行时引擎
-- `click_actions/`：点击与输入动作能力
-- `ocr/`：OCR 入口封装
-- `engine/`、`ui/`：分层导出模块
+- 通过 GUI 编排步骤（点击、输入、等待、条件判断）
+- 以 `start -> step -> branch` 的方式执行
+- 每步支持重试、失败跳转、日志
+- 支持流程图可视化检查脚本逻辑
 
-## 配置说明（私密）
+适合场景：
 
-项目使用 `set_ocr.txt` 存放 OCR/翻译密钥等敏感信息。  
-该文件已在 `.gitignore` 中排除，不会被提交到 Git。
+- 界面按钮位置会变化，但文本/图像特征稳定
+- 需要“成功继续、失败分支”的自动化流程
+- 需要复用流程并迁移到不同机器
 
-请按 `set_ocr.example.txt` 复制一份：
+---
 
-```bash
-cp set_ocr.example.txt set_ocr.txt
+## 2. 主要能力
+
+### 动作类步骤
+
+- `ClickText`：OCR 找文字并点击
+- `ClickPosition`：按屏幕坐标点击
+- `ClickImage`：模板匹配找图点击（支持置信度）
+- `TypeText`：向当前焦点输入整段文字（支持中文）
+- `KeyPress`：模拟按键
+- `Wait`：等待
+
+### 条件类步骤
+
+- `IfElse` + `ExistsText`
+- `IfElse` + `ExistsImage`
+
+### 控制能力
+
+- `retry_count` + `retry_interval_sec`
+- `on_error` 失败跳转
+- `next` 顺序跳转
+- 实时运行日志
+- 只读流程图（查看 `next / true / false / on_error`）
+
+---
+
+## 3. 模块结构与实现逻辑
+
+```text
+automation_studio.py      # 可视化编辑器（主入口）
+automation_runtime.py     # 流程执行引擎
+
+click_actions/
+  text_click.py           # 基于 OCR 的文字点击
+  position_click.py       # 坐标点击
+  image_click.py          # 模板匹配图片点击
+  text_type.py            # SendInput 文本输入
+
+ocr/
+  youdao_locator.py       # OCR 入口封装（转发到 youdao_text_locator）
+
+youdao_text_locator.py    # 有道 OCR 请求、结果解析、坐标映射（含 DPI）
 ```
 
-然后填写你自己的密钥信息。
+### 3.1 `automation_studio.py`（编辑器层）
 
-## 运行方式
+负责：
 
-双击根目录 `start.bat` 启动主界面。
+- 步骤列表管理（新增、删除、排序）
+- 步骤属性编辑（类型、跳转、重试）
+- 参数编辑（输入框 + JSON 同步）
+- 流程导入导出
+- 运行流程与显示日志
+- 绘制流程图（只读）
 
-## 依赖建议
+实现要点：
+
+- 运行前自动保存当前步骤，保证执行的是最新配置
+- 运行时自动隐藏窗口，避免识别到编辑器自身内容
+- 支持按步骤类型自动搭建参数骨架
+
+### 3.2 `automation_runtime.py`（执行引擎层）
+
+负责：
+
+- 按 `start` 进入流程，逐步执行
+- 识别动作步骤与 `IfElse` 条件步骤
+- 处理重试、失败跳转、结束状态
+- 输出结构化日志
+
+执行流程简述：
+
+1. 找到当前步骤
+2. 若是 `IfElse`，执行 condition，跳 `on_true` / `on_false`
+3. 若是动作步骤，执行动作并根据成功/失败走 `next` 或 `on_error`
+4. 遇到 `STOP` 或错误结束
+
+### 3.3 点击动作模块（`click_actions/`）
+
+- `text_click.py`  
+  调用 OCR 层定位文字坐标，支持单击/双击、精确匹配/包含匹配。
+
+- `position_click.py`  
+  直接调用 Windows 鼠标事件，适合固定点位。
+
+- `image_click.py`  
+  使用 OpenCV `matchTemplate` 做模板匹配：
+  - 支持 `confidence` 阈值
+  - `region` 可选；留空时自动使用虚拟全屏（自适应分辨率）
+  - 中文路径读取用 `np.fromfile + cv2.imdecode`，避免 `imread` 路径问题
+
+- `text_type.py`  
+  用 `SendInput + KEYEVENTF_UNICODE` 输入文本，支持中文内容、按字符间隔、可选末尾回车。
+
+### 3.4 OCR 模块（`youdao_text_locator.py`）
+
+负责：
+
+- 从 `set_ocr.txt` 读取 key/secret
+- 生成有道签名并调用 OCR API
+- 递归解析文字与边框
+- 将截图坐标映射到屏幕坐标
+- 处理 DPI 感知，避免坐标偏移
+
+---
+
+## 4. 配置文件（私密）
+
+项目使用 `set_ocr.txt` 保存敏感信息（API key/secret），该文件已在 `.gitignore` 忽略，不会被提交。
+
+### 使用方式
+
+1. 复制模板：
+
+```bash
+copy set_ocr.example.txt set_ocr.txt
+```
+
+2. 在 `set_ocr.txt` 中填写：
+
+- `youdao_appkey`
+- `youdao_appsecret`
+- `youdao_ocr_lang`（建议 `auto`）
+
+---
+
+## 5. `set_ocr.example.txt` 最小必要字段
+
+```txt
+youdao_appkey:
+youdao_appsecret:
+youdao_ocr_lang:auto
+```
+
+---
+
+## 6. 步骤参数示例
+
+### `ClickText`
+
+```json
+{
+  "text": "发送",
+  "exact_match": true,
+  "case_sensitive": false,
+  "delay_sec": 0,
+  "click_times": 1
+}
+```
+
+### `ClickPosition`
+
+```json
+{
+  "x": 1200,
+  "y": 800,
+  "delay_sec": 0,
+  "click_times": 1
+}
+```
+
+### `ClickImage`
+
+```json
+{
+  "template_path": "test/发送.png",
+  "confidence": 0.82,
+  "delay_sec": 0,
+  "click_times": 1
+}
+```
+
+> `region` 留空表示全屏自适应，不用按每台电脑重填分辨率。
+
+### `TypeText`
+
+```json
+{
+  "content": "你好，这是一段自动输入的文字",
+  "delay_sec": 0.1,
+  "interval_sec": 0.0,
+  "press_enter": false
+}
+```
+
+---
+
+## 7. 运行方式
+
+双击 `start.bat` 启动编辑器。
+
+---
+
+## 8. 依赖
 
 - Python 3.10+
-- `requests`
-- `pillow`
-- `opencv-python`
-- `numpy`
+- requests
+- pillow
+- opencv-python
+- numpy
 
