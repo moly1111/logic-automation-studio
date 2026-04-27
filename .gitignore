@@ -1,0 +1,11 @@
+# IDE / cache
+.idea/
+__pycache__/
+*.pyc
+
+# Local runtime outputs
+save/
+
+# Sensitive config
+set_ocr.txt
+

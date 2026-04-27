@@ -1,0 +1,22 @@
+# ========== 全局设置 ==========
+ocr_engine:youdao
+translate_engine:youdao
+
+# ========== DeepSeek 翻译配置 ==========
+deepseek_api:
+deepseek_model:deepseek-chat
+deepseek_temperature:1.2
+deepseek_prompt:请将以下内容翻译为中文，只返回翻译结果：
+
+# ========== 有道翻译配置 ==========
+youdao_appkey:
+youdao_appsecret:
+youdao_from:auto
+youdao_to:zh-CHS
+youdao_vocabId:
+
+# ========== 有道 OCR 配置 ==========
+youdao_ocr_lang:auto
+
+# ========== 阿里云 OCR 配置 ==========
+ali_appcode:
