@@ -1,3 +1,3 @@
-from automation_runtime import AutomationEngine, RunResult, RuntimeActions
+from automation_runtime import LazyModeConfig, AutomationEngine, RunResult, RuntimeActions
 
-__all__ = ["AutomationEngine", "RunResult", "RuntimeActions"]
+__all__ = ["LazyModeConfig", "AutomationEngine", "RunResult", "RuntimeActions"]

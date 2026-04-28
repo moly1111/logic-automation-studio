@@ -1,10 +1,14 @@
+import ctypes
 import json
+import random
+import os
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Optional
 
-from engine.runtime import AutomationEngine, RuntimeActions
+from engine.runtime import LazyModeConfig, AutomationEngine, RuntimeActions
 from ocr.youdao_locator import YoudaoTextLocator
 
 
@@ -84,21 +88,27 @@ IFELSE_CONDITION_TEMPLATE: Dict[str, Any] = {
 
 class AutomationStudio:
     def __init__(self) -> None:
+        self._mutex_handle = None
+        self._acquire_single_instance_mutex()
         # 先启用 DPI 感知，再创建 Tk 窗口，避免运行后窗口缩放跳变。
         YoudaoTextLocator.enable_dpi_awareness()
         self.root = tk.Tk()
         self.root.title("逻辑自动化脚本编辑引擎 (MVP)")
-        self.default_geometry = "1360x1080"
-        self.min_width = 1240
-        self.min_height = 900
+        self.default_geometry = "1260x1300"
+        self.min_width = 1080
+        self.min_height = 700
         self.root.geometry(self.default_geometry)
         self.root.minsize(self.min_width, self.min_height)
 
         self.flow: Dict[str, Any] = json.loads(json.dumps(FLOW_TEMPLATE))
         self.current_index: Optional[int] = None
         self.running = False
+        self.stop_requested = False
+        self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
         self.engine: Optional[AutomationEngine] = None
+        self._hotkey_running = True
+        self.hotkey_thread: Optional[threading.Thread] = None
 
         self.start_var = tk.StringVar(value=self.flow.get("start", ""))
         self.step_id_var = tk.StringVar()
@@ -110,6 +120,20 @@ class AutomationStudio:
         self.post_delay_var = tk.StringVar(value="0")
         self.on_true_var = tk.StringVar(value="STOP")
         self.on_false_var = tk.StringVar(value="STOP")
+        self.loop_count_var = tk.StringVar(value="3")
+        self.infinite_loop_var = tk.BooleanVar(value=False)
+        self.auto_background_var = tk.BooleanVar(value=False)
+        self.adaptive_mode_var = tk.BooleanVar(value=True)
+        self.exec_mode_var = tk.StringVar(value="strict")
+        self.lazy_grid_var = tk.StringVar(value="10")
+        self.lazy_sample_blocks_var = tk.StringVar(value="9")
+        self.lazy_similarity_var = tk.StringVar(value="0.88")
+        self.lazy_recheck_var = tk.StringVar(value="50")
+        self.lazy_warmup_rounds_var = tk.StringVar(value="12")
+        self.lazy_warmup_repeat_threshold_var = tk.StringVar(value="0.90")
+        self.lazy_warmup_coord_tol_var = tk.StringVar(value="5")
+        self.loop_fail_retry_var = tk.StringVar(value="3")
+        self.loop_fail_retry_interval_var = tk.StringVar(value="1.0")
 
         self.params_text: Optional[tk.Text] = None
         self.condition_text: Optional[tk.Text] = None
@@ -117,9 +141,42 @@ class AutomationStudio:
         self.step_list: Optional[tk.Listbox] = None
         self.param_form_frame: Optional[ttk.Frame] = None
         self.param_controls: Dict[str, Any] = {}
+        self.show_clicktext_target_var = tk.BooleanVar(value=False)
+        self.adaptive_settings_win: Optional[tk.Toplevel] = None
+        self.log_collapsed_var = tk.BooleanVar(value=False)
+        self.log_box: Optional[ttk.LabelFrame] = None
+        self.log_toggle_btn: Optional[ttk.Button] = None
 
         self._build_ui()
         self.refresh_step_list()
+        self._start_hotkey_listener()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _acquire_single_instance_mutex(self) -> None:
+        """
+        防止重复启动多个实例导致后台循环难以察觉。
+        """
+        kernel32 = ctypes.windll.kernel32
+        mutex_name = "Global\\LogicAutomationStudio_SingleInstance"
+        handle = kernel32.CreateMutexW(None, False, mutex_name)
+        if not handle:
+            return
+        self._mutex_handle = handle
+        ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            # 已有实例在运行，直接提示并退出当前进程。
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "检测到程序已在运行，请先切回已有窗口或先停止旧实例。",
+                "Logic Automation Studio",
+                0x40,
+            )
+            os._exit(0)
+
+    def _release_single_instance_mutex(self) -> None:
+        if self._mutex_handle:
+            ctypes.windll.kernel32.CloseHandle(self._mutex_handle)
+            self._mutex_handle = None
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -160,19 +217,46 @@ class AutomationStudio:
         run_btns.pack(fill="x", padx=6, pady=(2, 6))
         ttk.Button(run_btns, text="运行", command=self.run_flow).grid(row=0, column=0, padx=2, pady=2)
         ttk.Button(run_btns, text="停止", command=self.stop_flow).grid(row=0, column=1, padx=2, pady=2)
-        ttk.Button(run_btns, text="保存步骤", command=self.save_current_step).grid(row=1, column=0, padx=2, pady=2, sticky="we")
+        ttk.Label(run_btns, text="循环次数").grid(row=1, column=0, sticky="w", padx=2, pady=2)
+        ttk.Entry(run_btns, textvariable=self.loop_count_var, width=10).grid(row=1, column=1, sticky="we", padx=2, pady=2)
+        ttk.Checkbutton(run_btns, text="无限循环", variable=self.infinite_loop_var).grid(
+            row=2, column=0, sticky="w", padx=2, pady=2
+        )
+        ttk.Button(run_btns, text="循环运行", command=self.run_flow_loop).grid(
+            row=2, column=1, padx=2, pady=2, sticky="we"
+        )
+        ttk.Checkbutton(run_btns, text="自动后台运行", variable=self.auto_background_var).grid(
+            row=3, column=0, sticky="w", padx=2, pady=2
+        )
+        ttk.Checkbutton(run_btns, text="启用自适应模式", variable=self.adaptive_mode_var).grid(
+            row=3, column=1, sticky="w", padx=2, pady=2
+        )
+        ttk.Label(run_btns, text="失败重试次数").grid(row=4, column=0, sticky="w", padx=2, pady=2)
+        ttk.Entry(run_btns, textvariable=self.loop_fail_retry_var, width=10).grid(
+            row=4, column=1, sticky="we", padx=2, pady=2
+        )
+        ttk.Label(run_btns, text="重试间隔(秒)").grid(row=5, column=0, sticky="w", padx=2, pady=2)
+        ttk.Entry(run_btns, textvariable=self.loop_fail_retry_interval_var, width=10).grid(
+            row=5, column=1, sticky="we", padx=2, pady=2
+        )
+        ttk.Button(run_btns, text="自适应参数", command=self.open_adaptive_settings).grid(
+            row=6, column=0, columnspan=2, padx=2, pady=2, sticky="we"
+        )
         ttk.Button(run_btns, text="自动搭建JSON骨架", command=self.apply_json_template).grid(
-            row=1, column=1, padx=2, pady=2, sticky="we"
+            row=7, column=0, columnspan=2, padx=2, pady=2, sticky="we"
         )
         ttk.Button(run_btns, text="查看流程图", command=self.show_flow_diagram).grid(
-            row=2, column=0, columnspan=2, padx=2, pady=2, sticky="we"
+            row=8, column=0, columnspan=2, padx=2, pady=2, sticky="we"
+        )
+        ttk.Label(run_btns, text="(详细自适应参数请点“自适应参数”)").grid(
+            row=9, column=0, columnspan=2, sticky="w", padx=2, pady=2
         )
         run_btns.columnconfigure(0, weight=1)
         run_btns.columnconfigure(1, weight=1)
 
         info = ttk.Label(
             left_box,
-            text="提示：先选中步骤再编辑右侧字段（点击可设 click_times 或 double_click）",
+            text="提示：双击键盘上方 - 启动，双击 = 停止并显示窗口",
             foreground="#666666",
         )
         info.pack(anchor="w", padx=8, pady=(0, 8))
@@ -182,6 +266,11 @@ class AutomationStudio:
         editor = ttk.Frame(top_right)
         editor.pack(fill="x", padx=6, pady=4)
         editor.columnconfigure(3, weight=1)
+        editor.columnconfigure(4, weight=0)
+
+        ttk.Button(editor, text="保存步骤", command=self.save_current_step).grid(
+            row=0, column=4, rowspan=2, sticky="ne", padx=(10, 0), pady=2
+        )
 
         ttk.Label(editor, text="流程起点ID").grid(row=0, column=0, sticky="w")
         ttk.Entry(editor, textvariable=self.start_var, width=16).grid(row=0, column=1, sticky="w", padx=(8, 16), pady=4)
@@ -242,18 +331,62 @@ class AutomationStudio:
         self.condition_text = tk.Text(json_box, width=50, height=6)
         self.condition_text.grid(row=2, column=1, sticky="nsew", padx=(0, 6), pady=6)
 
-        log_box = ttk.LabelFrame(bottom_right, text="运行日志")
-        log_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-        log_box.columnconfigure(0, weight=1)
-        log_box.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(log_box, height=8)
-        self.log_text.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.log_box = ttk.LabelFrame(bottom_right, text="运行日志")
+        self.log_box.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.log_box.columnconfigure(0, weight=1)
+        self.log_box.rowconfigure(1, weight=1)
+        log_toolbar = ttk.Frame(self.log_box)
+        log_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+        log_toolbar.columnconfigure(0, weight=1)
+        ttk.Label(log_toolbar, text="提示：运行时可折叠日志，减少界面变化干扰").grid(row=0, column=0, sticky="w")
+        self.log_toggle_btn = ttk.Button(log_toolbar, text="折叠日志", command=self.toggle_log_panel)
+        self.log_toggle_btn.grid(row=0, column=1, sticky="e")
+        self.log_text = tk.Text(self.log_box, height=8)
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        # 模式高光：仅底色，不修改字体颜色
+        self.log_text.tag_configure("mode_strict", background="#DDEBFF")
+        self.log_text.tag_configure("mode_lazy", background="#DFF5E3")
+        self.log_text.tag_configure("mode_alert", background="#FFF3BF")
+        self.log_text.tag_configure("guard", background="#E8F7FF")
+        self.log_text.tag_configure("warn", background="#FFE8E8")
 
-    def log(self, msg: str) -> None:
+    @staticmethod
+    def _infer_log_tag(msg: str) -> Optional[str]:
+        if "phase=STRICT_ONLY" in msg or "phase=WARMUP" in msg or "round_mode=STRICT" in msg:
+            return "mode_strict"
+        if "phase=LAZY" in msg or "round_mode=LAZY" in msg:
+            return "mode_lazy"
+        if "phase=ALERT" in msg:
+            return "mode_alert"
+        if "LazyGuard" in msg or "守卫" in msg or "警戒复核" in msg or "ALERT" in msg:
+            return "guard"
+        if "失败" in msg or "异常" in msg or "STRICT_ONLY" in msg:
+            return "warn"
+        return None
+
+    def log(self, msg: str, tag: Optional[str] = None) -> None:
         if not self.log_text:
             return
-        self.log_text.insert("end", msg + "\n")
+        use_tag = tag or self._infer_log_tag(msg)
+        if use_tag:
+            self.log_text.insert("end", msg + "\n", (use_tag,))
+        else:
+            self.log_text.insert("end", msg + "\n")
         self.log_text.see("end")
+
+    def toggle_log_panel(self) -> None:
+        if not self.log_box or not self.log_text:
+            return
+        collapsed = not self.log_collapsed_var.get()
+        self.log_collapsed_var.set(collapsed)
+        if collapsed:
+            self.log_text.grid_remove()
+            if self.log_toggle_btn:
+                self.log_toggle_btn.configure(text="展开日志")
+        else:
+            self.log_text.grid()
+            if self.log_toggle_btn:
+                self.log_toggle_btn.configure(text="折叠日志")
 
     def _hide_window(self) -> None:
         self.root.withdraw()
@@ -270,6 +403,128 @@ class AutomationStudio:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+
+    @staticmethod
+    def _is_top_number_pressed(vk_code: int) -> bool:
+        user32 = ctypes.windll.user32
+        return (user32.GetAsyncKeyState(vk_code) & 0x8000) != 0
+
+    def _start_hotkey_listener(self) -> None:
+        def loop() -> None:
+            double_window = 0.35
+            debounce = 0.12
+            last_state_1 = False
+            last_state_2 = False
+            last_edge_1 = 0.0
+            last_edge_2 = 0.0
+            last_press_1: Optional[float] = None
+            last_press_2: Optional[float] = None
+
+            while self._hotkey_running:
+                now = time.time()
+                s1 = self._is_top_number_pressed(0xBD)  # 顶部减号 -
+                s2 = self._is_top_number_pressed(0xBB)  # 顶部等号 =
+
+                if s1 and not last_state_1:
+                    if now - last_edge_1 >= debounce:
+                        last_edge_1 = now
+                        if last_press_1 is not None and now - last_press_1 <= double_window:
+                            self.root.after(0, self._hotkey_start_run)
+                            last_press_1 = None
+                        else:
+                            last_press_1 = now
+                last_state_1 = s1
+
+                if s2 and not last_state_2:
+                    if now - last_edge_2 >= debounce:
+                        last_edge_2 = now
+                        if last_press_2 is not None and now - last_press_2 <= double_window:
+                            self.root.after(0, self._hotkey_stop_run)
+                            last_press_2 = None
+                        else:
+                            last_press_2 = now
+                last_state_2 = s2
+                time.sleep(0.01)
+
+        self.hotkey_thread = threading.Thread(target=loop, daemon=True)
+        self.hotkey_thread.start()
+
+    def _hotkey_start_run(self) -> None:
+        if self.running:
+            self.log("热键启动忽略：流程已在运行中")
+            return
+        self.log("热键触发：双击- -> 启动运行")
+        self.run_flow_loop()
+
+    def _hotkey_stop_run(self) -> None:
+        self.log("热键触发：双击= -> 停止运行")
+        self.stop_flow()
+        self._show_window()
+
+    def open_adaptive_settings(self) -> None:
+        if self.adaptive_settings_win and self.adaptive_settings_win.winfo_exists():
+            self.adaptive_settings_win.deiconify()
+            self.adaptive_settings_win.lift()
+            self.adaptive_settings_win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        self.adaptive_settings_win = win
+        win.title("自适应参数设置")
+        win.geometry("420x360")
+        win.resizable(False, False)
+
+        def on_close() -> None:
+            self.adaptive_settings_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+
+        ttk.Label(frm, text="执行模式").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Combobox(
+            frm,
+            textvariable=self.exec_mode_var,
+            values=["strict", "lazy"],
+            state="readonly",
+            width=16,
+        ).grid(row=0, column=1, sticky="we", pady=6)
+
+        ttk.Label(frm, text="切块（10=10x10）").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=self.lazy_grid_var, width=20).grid(row=1, column=1, sticky="we", pady=6)
+
+        ttk.Label(frm, text="抽样块数（奇数）").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=self.lazy_sample_blocks_var, width=20).grid(row=2, column=1, sticky="we", pady=6)
+
+        ttk.Label(frm, text="相似度阈值").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=self.lazy_similarity_var, width=20).grid(row=3, column=1, sticky="we", pady=6)
+
+        ttk.Label(frm, text="警戒复核间隔（轮）").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=self.lazy_recheck_var, width=20).grid(row=4, column=1, sticky="we", pady=6)
+
+        ttk.Label(frm, text="预热严格轮数").grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=self.lazy_warmup_rounds_var, width=20).grid(row=5, column=1, sticky="we", pady=6)
+
+        ttk.Label(frm, text="预热重复度阈值").grid(row=6, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=self.lazy_warmup_repeat_threshold_var, width=20).grid(row=6, column=1, sticky="we", pady=6)
+
+        ttk.Label(frm, text="预热坐标容差(px)").grid(row=7, column=0, sticky="w", pady=6)
+        ttk.Entry(frm, textvariable=self.lazy_warmup_coord_tol_var, width=20).grid(row=7, column=1, sticky="we", pady=6)
+
+        ttk.Button(frm, text="关闭", command=on_close).grid(row=8, column=0, columnspan=2, pady=(12, 0))
+
+    def _on_close(self) -> None:
+        self._hotkey_running = False
+        self.stop_flow()
+        # 给停止流程一点时间响应；若卡住，强制结束进程避免残留循环。
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=1.5)
+        self._release_single_instance_mutex()
+        self.root.destroy()
+        os._exit(0)
 
     def refresh_step_list(self) -> None:
         if not self.step_list:
@@ -389,7 +644,27 @@ class AutomationStudio:
             self.param_controls[key] = ("bool", var)
 
         if stype == "ClickText":
-            add_label_entry(0, 0, "目标文字", "text", "发送")
+            ttk.Label(self.param_form_frame, text="目标文字").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+            text_var = tk.StringVar(value=str(params.get("text", "发送")))
+            text_entry = ttk.Entry(
+                self.param_form_frame,
+                textvariable=text_var,
+                width=18,
+                show="" if self.show_clicktext_target_var.get() else "•",
+            )
+            text_entry.grid(row=0, column=1, sticky="we", padx=(0, 10), pady=2)
+            self.param_controls["text"] = ("str", text_var)
+
+            def toggle_clicktext_visible() -> None:
+                text_entry.configure(show="" if self.show_clicktext_target_var.get() else "•")
+
+            ttk.Checkbutton(
+                self.param_form_frame,
+                text="显示",
+                variable=self.show_clicktext_target_var,
+                command=toggle_clicktext_visible,
+            ).grid(row=0, column=4, sticky="w", padx=(0, 10), pady=2)
+
             add_label_entry(0, 2, "延迟(秒)", "delay_sec", 0)
             add_label_entry(1, 0, "点击次数", "click_times", 1)
             add_label_entry(1, 2, "点击间隔", "click_interval_sec", 0.08)
@@ -559,32 +834,232 @@ class AutomationStudio:
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
-    def run_flow(self) -> None:
+    def _run_worker(self, loop_times: Optional[int]) -> None:
+        """
+        loop_times:
+        - None: 无限循环
+        - 正整数: 指定循环次数
+        """
+        try:
+            grid = max(1, int(float(self.lazy_grid_var.get().strip() or "10")))
+            sample_blocks = max(1, int(float(self.lazy_sample_blocks_var.get().strip() or "9")))
+            similarity = float(self.lazy_similarity_var.get().strip() or "0.88")
+            recheck_interval = max(1, int(float(self.lazy_recheck_var.get().strip() or "50")))
+            warmup_rounds = max(1, int(float(self.lazy_warmup_rounds_var.get().strip() or "12")))
+            warmup_repeat_threshold = float(self.lazy_warmup_repeat_threshold_var.get().strip() or "0.90")
+            warmup_coord_tol = max(0, int(float(self.lazy_warmup_coord_tol_var.get().strip() or "5")))
+            fail_retry_max = max(0, int(float(self.loop_fail_retry_var.get().strip() or "0")))
+            fail_retry_interval = max(0.0, float(self.loop_fail_retry_interval_var.get().strip() or "1.0"))
+        except ValueError:
+            self.log("Lazy 配置格式错误，回退为默认值")
+            grid, sample_blocks, similarity, recheck_interval, warmup_rounds = 10, 9, 0.88, 50, 12
+            warmup_repeat_threshold, warmup_coord_tol = 0.90, 5
+            fail_retry_max, fail_retry_interval = 0, 1.0
+
+        adaptive_enabled = self.adaptive_mode_var.get()
+        requested_mode = self.exec_mode_var.get().strip().lower()
+        if adaptive_enabled:
+            # 勾选自适应后，模式由状态机自动判断，不再依赖手工 strict/lazy。
+            effective_mode = "adaptive-auto"
+            self.log("自适应提示 -> 已启用自动判模：WARMUP -> LAZY -> ALERT -> (LAZY/STRICT_ONLY)", tag="guard")
+        else:
+            effective_mode = "strict"
+            if requested_mode == "lazy":
+                self.log("提示 -> 未启用自适应时，lazy 不生效，已按 strict 运行", tag="warn")
+
+        lazy_cfg = LazyModeConfig(
+            enabled=adaptive_enabled,
+            grid_rows=grid,
+            grid_cols=grid,
+            sample_blocks=sample_blocks,
+            similarity_threshold=similarity,
+            recheck_interval=recheck_interval,
+            warmup_repeat_threshold=warmup_repeat_threshold,
+            warmup_coord_tolerance_px=warmup_coord_tol,
+        )
+        runtime = RuntimeActions(config_path="set_ocr.txt", logger=self.log, stop_event=self.stop_event)
+        runtime.configure_lazy_mode(lazy_cfg)
+        self.log(
+            "运行配置 -> "
+            f"adaptive_enabled={adaptive_enabled}, mode={requested_mode}, effective_mode={effective_mode}, "
+            f"grid={grid}x{grid}, sample_blocks={sample_blocks}, similarity={similarity}, "
+            f"recheck_interval={recheck_interval}, warmup_rounds={warmup_rounds}, "
+            f"warmup_repeat_threshold={warmup_repeat_threshold}, warmup_coord_tol={warmup_coord_tol}, "
+            f"fail_retry={fail_retry_max}, fail_retry_interval={fail_retry_interval}, "
+            f"infinite_loop={self.infinite_loop_var.get()}"
+        )
+        if lazy_cfg.enabled:
+            self.log("自适应流程 -> WARMUP(严格建参考) -> LAZY(坐标复用+守卫) -> ALERT(单轮严格复核)", tag="guard")
+
+        loop_index = 0
+        lazy_phase = "WARMUP" if lazy_cfg.enabled else "STRICT_ONLY"
+        alert_reason = ""
+        warmup_ok_rounds = 0
+        fail_retry_used = 0
+        while not self.stop_requested:
+            if loop_times is not None and loop_index >= loop_times:
+                break
+            loop_index += 1
+            loop_label = f"{loop_index}/{loop_times}" if loop_times is not None else f"{loop_index}/∞"
+            # 状态机：
+            # STRICT_ONLY -> 每轮严格
+            # WARMUP -> 先严格收集参考
+            # LAZY -> 坐标复用 + 低耗守卫
+            # ALERT -> 单轮严格复核，成功回 LAZY，失败转 STRICT_ONLY
+            if lazy_phase == "STRICT_ONLY":
+                round_mode = "STRICT"
+            elif lazy_phase == "WARMUP":
+                round_mode = "STRICT"
+            elif lazy_phase == "ALERT":
+                round_mode = "STRICT"
+            else:
+                round_mode = "LAZY"
+            phase_tag = "mode_strict"
+            if lazy_phase == "LAZY":
+                phase_tag = "mode_lazy"
+            elif lazy_phase == "ALERT":
+                phase_tag = "mode_alert"
+            self.log(f"阶段状态 -> phase={lazy_phase}, round_mode={round_mode}", tag=phase_tag)
+
+            guard_step_id: Optional[str] = None
+            if round_mode == "LAZY":
+                cached_ids = runtime.get_cached_action_step_ids()
+                if cached_ids:
+                    guard_step_id = random.choice(cached_ids)
+                    self.log(f"LazyGuard 计划 -> 本轮抽检步骤: {guard_step_id}（缓存总数={len(cached_ids)}）", tag="guard")
+                else:
+                    self.log("LazyGuard 提示 -> 当前无可用缓存步骤，守卫抽检跳过（建议先完成一轮 WARMUP）", tag="warn")
+
+            runtime.set_execution_mode(round_mode, guard_step_id=guard_step_id)
+            self.log(f"=== 循环 {loop_label} 开始（mode={round_mode}, phase={lazy_phase}） ===")
+            if guard_step_id:
+                self.log(f"LazyGuard 执行 -> 目标步骤: {guard_step_id}", tag="guard")
+            self.engine = AutomationEngine(runtime=runtime, logger=self.log)
+            result = self.engine.run_flow(self.flow)
+            self.log(f"=== 循环 {loop_label} 结束: ok={result.ok}, msg={result.message}, step={result.step_id} ===")
+            if lazy_cfg.enabled:
+                if lazy_phase == "WARMUP":
+                    if result.ok:
+                        rpt = runtime.get_warmup_repeatability()
+                        self.log(
+                            "WARMUP 检查 -> "
+                            f"cacheable_total={rpt['cacheable_total']}, compared={rpt['compared']}, "
+                            f"stable={rpt['stable']}, repeat_ratio={rpt['repeat_ratio']:.3f}, "
+                            f"threshold={rpt['threshold']:.3f}, coord_tol={rpt['coord_tolerance_px']}",
+                            tag="guard",
+                        )
+                        if rpt["qualified"]:
+                            warmup_ok_rounds += 1
+                            self.log(
+                                f"WARMUP 进度 -> {warmup_ok_rounds}/{warmup_rounds}（高重复度达标）",
+                                tag="mode_strict",
+                            )
+                        else:
+                            warmup_ok_rounds = 0
+                            self.log("WARMUP 未达标 -> 未满足高重复度，进度已清零", tag="warn")
+                        if warmup_ok_rounds >= warmup_rounds:
+                            lazy_phase = "LAZY"
+                            self.log("模式切换 -> WARMUP => LAZY（连续高重复度预热达标）", tag="mode_lazy")
+                    elif not result.ok:
+                        lazy_phase = "STRICT_ONLY"
+                        self.log("模式切换 -> WARMUP => STRICT_ONLY（Warmup 失败）", tag="mode_strict")
+                elif lazy_phase == "LAZY":
+                    periodic_alert = (loop_index % lazy_cfg.recheck_interval == 0)
+                    guard_alert = runtime.consume_alert_requested()
+                    if periodic_alert:
+                        lazy_phase = "ALERT"
+                        alert_reason = f"周期复核（每{lazy_cfg.recheck_interval}轮）"
+                        self.log(f"模式切换 -> LAZY => ALERT（{alert_reason}）", tag="mode_alert")
+                        self.log("守卫流程 -> 进入 ALERT，本轮将执行一次严格复核", tag="guard")
+                    elif guard_alert:
+                        lazy_phase = "ALERT"
+                        alert_reason = "低耗守卫投票不足"
+                        self.log(f"模式切换 -> LAZY => ALERT（{alert_reason}）", tag="mode_alert")
+                        self.log("守卫流程 -> 守卫判定异常，进入 ALERT 进行单轮严格复核", tag="guard")
+                elif lazy_phase == "ALERT":
+                    if result.ok:
+                        lazy_phase = "LAZY"
+                        self.log("模式切换 -> ALERT => LAZY（警戒复核通过）", tag="mode_lazy")
+                        self.log("守卫流程 -> ALERT 复核通过，回到 LAZY", tag="guard")
+                    else:
+                        lazy_phase = "STRICT_ONLY"
+                        self.log("模式切换 -> ALERT => STRICT_ONLY（警戒复核失败）", tag="mode_strict")
+                        self.log("守卫流程 -> ALERT 复核失败，降级为 STRICT_ONLY", tag="guard")
+
+            if not result.ok:
+                if fail_retry_used < fail_retry_max:
+                    fail_retry_used += 1
+                    self.log(
+                        f"循环失败重试 -> {fail_retry_used}/{fail_retry_max}，"
+                        f"{fail_retry_interval:.2f}s 后重试同一轮",
+                        tag="warn",
+                    )
+                    if fail_retry_interval > 0 and not self.stop_event.wait(fail_retry_interval):
+                        continue
+                    if self.stop_requested:
+                        break
+                    continue
+                self.log("循环失败重试 -> 已达上限，结束运行", tag="warn")
+                break
+            fail_retry_used = 0
+        if self.stop_requested:
+            self.log("=== 循环运行已手动停止 ===")
+        elif loop_times is None:
+            self.log("=== 循环运行结束（无限循环被中断） ===")
+        else:
+            self.log(f"=== 循环运行结束，共执行 {loop_index} 轮 ===")
+
+    def _start_run(self, loop_times: Optional[int]) -> None:
         if self.running:
             self.log("流程已在运行中")
             return
         if self.current_index is not None:
             self.save_current_step()
+        self.stop_requested = False
+        self.stop_event.clear()
         self.running = True
-        self._hide_window()
-        self.log("=== 开始运行 ===")
-        runtime = RuntimeActions(config_path="set_ocr.txt", logger=self.log)
-        self.engine = AutomationEngine(runtime=runtime, logger=self.log)
+        if self.auto_background_var.get():
+            self._hide_window()
+        if loop_times is None:
+            self.log("=== 开始运行（无限循环） ===")
+        elif loop_times <= 1:
+            self.log("=== 开始运行 ===")
+        else:
+            self.log(f"=== 开始运行（循环 {loop_times} 次） ===")
 
         def worker() -> None:
             try:
-                result = self.engine.run_flow(self.flow)
-                self.log(f"=== 结束: ok={result.ok}, msg={result.message}, step={result.step_id} ===")
+                self._run_worker(loop_times=loop_times)
             except Exception as e:
                 self.log(f"=== 运行异常: {e} ===")
             finally:
                 self.running = False
-                self.root.after(0, self._show_window)
+                if self.auto_background_var.get():
+                    self.root.after(0, self._show_window)
 
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
 
+    def run_flow(self) -> None:
+        self._start_run(loop_times=1)
+
+    def run_flow_loop(self) -> None:
+        if self.infinite_loop_var.get():
+            self._start_run(loop_times=None)
+            return
+        try:
+            times = int(float(self.loop_count_var.get().strip() or "0"))
+        except ValueError:
+            messagebox.showwarning("提示", "循环次数必须是数字")
+            return
+        if times <= 0:
+            messagebox.showwarning("提示", "循环次数必须大于 0")
+            return
+        self._start_run(loop_times=times)
+
     def stop_flow(self) -> None:
+        self.stop_requested = True
+        self.stop_event.set()
         if self.engine:
             self.engine.request_stop()
             self.log("已请求停止")

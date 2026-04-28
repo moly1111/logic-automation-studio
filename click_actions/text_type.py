@@ -9,6 +9,17 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", ctypes.c_uint),
+        ("dwFlags", ctypes.c_uint),
+        ("time", ctypes.c_uint),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
         ("wVk", ctypes.c_ushort),
@@ -19,8 +30,20 @@ class KEYBDINPUT(ctypes.Structure):
     ]
 
 
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.c_uint),
+        ("wParamL", ctypes.c_ushort),
+        ("wParamH", ctypes.c_ushort),
+    ]
+
+
 class _INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT)]
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
 
 
 class INPUT(ctypes.Structure):
@@ -39,7 +62,8 @@ def _send_input_pair(user32, scan: int) -> None:
     arr = (INPUT * 2)(down, up)
     sent = user32.SendInput(2, arr, ctypes.sizeof(INPUT))
     if sent != 2:
-        raise RuntimeError(f"SendInput Unicode 失败: 返回 {sent}")
+        err = ctypes.GetLastError()
+        raise RuntimeError(f"SendInput Unicode 失败: 返回 {sent}, last_error={err}")
 
 
 def _send_vk_pair(user32, vk: int) -> None:
@@ -54,7 +78,8 @@ def _send_vk_pair(user32, vk: int) -> None:
     arr = (INPUT * 2)(down, up)
     sent = user32.SendInput(2, arr, ctypes.sizeof(INPUT))
     if sent != 2:
-        raise RuntimeError(f"SendInput 按键失败: vk={vk} 返回 {sent}")
+        err = ctypes.GetLastError()
+        raise RuntimeError(f"SendInput 按键失败: vk={vk} 返回 {sent}, last_error={err}")
 
 
 def type_unicode_text(
