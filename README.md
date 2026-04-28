@@ -117,7 +117,7 @@ youdao_text_locator.py    # 有道 OCR 请求、结果解析、坐标映射（�
 - 预热阶段通过“重复度阈值 + 坐标容差 + 连续达标轮数”判定是否可进入 `LAZY`。
 - 所有动作步骤都纳入守卫与参考（`ClickText` / `ClickImage` / `ClickPosition` / `TypeText` / `KeyPress` / `Wait`）。
 
-状态图（项目根目录）：
+状态图：
 
 ![自适应模式状态图](自适应模式状态图.png)
 
